@@ -46,8 +46,8 @@ def load_model():
     try:
         classifier = get_classifier()
     except FileNotFoundError as e:
-        print(f"⚠️  WARNING: {e}")
-        print("   Run `python model/train.py` to generate the model.")
+        print(f"⚠️  WARNING: Model not loaded: {e}")
+        classifier = None
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
