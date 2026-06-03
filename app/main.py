@@ -12,7 +12,8 @@ import os
 import sys
 
 # Add project root to path so model.predict imports cleanly
-sys.path.insert(0, '/opt/render/project/src')
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 from model.predict import get_classifier
                 
 
