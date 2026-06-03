@@ -12,8 +12,9 @@ import os
 import sys
 
 # Add project root to path so model.predict imports cleanly
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, '/opt/render/project/src')
 from model.predict import get_classifier
+                
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(
