@@ -1,5 +1,5 @@
 """
-FintechRoute AI — FastAPI Application (Render-ready, self-contained)
+FintechRoute AI — FastAPI Application
 Nigerian Fintech Customer Complaint Classifier API
 """
 
@@ -9,64 +9,63 @@ from pydantic import BaseModel, Field
 from typing import Optional
 import time
 import os
-import json
-import numpy as np
-import torch
-from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
+import sys
 
-# ── Model loading ─────────────────────────────────────────────────────────────
-MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "model", "fintechroute_model")
-MAX_LEN = 128
-
-classifier_model = None
-tokenizer = None
-label_map = None
-
-def load_model():
-    global classifier_model, tokenizer, label_map
-    try:
-        print(f"🔄 Loading model from {MODEL_DIR}...")
-        tokenizer = DistilBertTokenizerFast.from_pretrained(MODEL_DIR)
-        classifier_model = DistilBertForSequenceClassification.from_pretrained(MODEL_DIR)
-        classifier_model.eval()
-        with open(os.path.join(MODEL_DIR, "label_map.json")) as f:
-            raw = json.load(f)
-        label_map = {int(k): v for k, v in raw.items()}
-        print("✅ Model loaded successfully.")
-    except Exception as e:
-        print(f"⚠️ Model not loaded: {e}")
-
-def predict(text: str) -> dict:
-    if classifier_model is None:
-        return {"category": "General", "confidence": 0.0, "all_scores": {}}
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding="max_length", max_length=MAX_LEN)
-    with torch.no_grad():
-        logits = classifier_model(**inputs).logits
-    probs = torch.softmax(logits, dim=-1).squeeze().numpy()
-    pred_idx = int(np.argmax(probs))
-    return {
-        "category": label_map[pred_idx],
-        "confidence": round(float(probs[pred_idx]), 4),
-        "all_scores": {label_map[i]: round(float(probs[i]), 4) for i in range(len(label_map))}
-    }
+# Add project root to path so model.predict imports cleanly
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from model.predict import get_classifier
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="FintechRoute AI",
-    description="Nigerian Fintech Customer Complaint Classifier API. Routes complaints to the correct department using fine-tuned DistilBERT.",
+    description=(
+        "Nigerian Fintech Customer Complaint Classifier API. "
+        "Automatically routes customer complaints to the correct department "
+        "using a fine-tuned DistilBERT model."
+    ),
     version="1.0.0",
+    contact={
+        "name": "Wisdom Santandave",
+        "url": "https://github.com/Santandave961",
+    },
 )
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Load model on startup ─────────────────────────────────────────────────────
+classifier = None
 
 @app.on_event("startup")
-def startup():
-    load_model()
+async def load_model():
+    import threading
+    def _load():
+        global classifier
+        try:
+            classifier = get_classifier()
+        except FileNotFoundError as e:
+            print(f" WARNING: Model not loaded: {e}")
+            classifier = None
+    threading.Thread(target=_load, daemon=True).start()
+
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 class ComplaintRequest(BaseModel):
-    text: str = Field(..., min_length=5, max_length=1000, example="My transfer has been pending for over 24 hours.")
-    include_all_scores: Optional[bool] = False
+    text: str = Field(
+        ...,
+        min_length=5,
+        max_length=1000,
+        example="My transfer has been pending for over 24 hours and no one is responding.",
+    )
+    include_all_scores: Optional[bool] = Field(
+        False,
+        description="If true, returns confidence scores for all 8 categories.",
+    )
+
 
 class ClassificationResult(BaseModel):
     category: str
@@ -76,10 +75,20 @@ class ClassificationResult(BaseModel):
     all_scores: Optional[dict] = None
     processing_time_ms: float
 
-class BatchRequest(BaseModel):
-    complaints: list[str] = Field(..., min_items=1, max_items=50)
 
-# ── Routing ───────────────────────────────────────────────────────────────────
+class BatchRequest(BaseModel):
+    complaints: list[str] = Field(
+        ...,
+        min_items=1,
+        max_items=50,
+        example=[
+            "Someone withdrew money from my account without permission.",
+            "My loan application was rejected without any reason.",
+        ],
+    )
+
+
+# ── Department routing & priority logic ──────────────────────────────────────
 DEPARTMENT_MAP = {
     "Fraud":    {"department": "Fraud & Security Team",     "priority": "CRITICAL"},
     "Transfer": {"department": "Payments & Transfers Team", "priority": "HIGH"},
@@ -91,40 +100,94 @@ DEPARTMENT_MAP = {
     "General":  {"department": "General Customer Service",  "priority": "LOW"},
 }
 
+
 # ── Routes ────────────────────────────────────────────────────────────────────
-@app.get("/")
+@app.get("/", tags=["Root"])
 def root():
-    return {"name": "FintechRoute AI", "version": "1.0.0", "author": "github.com/Santandave961", "docs": "/docs"}
+    return {
+        "name": "FintechRoute AI",
+        "description": "Nigerian Fintech Complaint Classifier API",
+        "version": "1.0.0",
+        "author": "github.com/Santandave961",
+        "endpoints": ["/classify", "/classify/batch", "/categories", "/health", "/docs"],
+    }
 
-@app.get("/health")
-def health():
-    return {"status": "ok" if classifier_model else "model_not_loaded", "model": "distilbert-base-uncased (fine-tuned)", "categories": 8}
 
-@app.get("/categories")
-def categories():
-    return {"total": len(DEPARTMENT_MAP), "categories": [{"name": k, **v} for k, v in DEPARTMENT_MAP.items()]}
+@app.get("/health", tags=["Health"])
+def health_check():
+    return {
+        "status": "ok" if classifier else "model_not_loaded",
+        "model": "distilbert-base-uncased (fine-tuned)",
+        "categories": 8,
+    }
 
-@app.post("/classify", response_model=ClassificationResult)
-def classify(request: ComplaintRequest):
+
+@app.get("/categories", tags=["Info"])
+def get_categories():
+    return {
+        "total": len(DEPARTMENT_MAP),
+        "categories": [
+            {
+                "name": cat,
+                "department": info["department"],
+                "priority": info["priority"],
+            }
+            for cat, info in DEPARTMENT_MAP.items()
+        ],
+    }
+
+
+@app.post("/classify", response_model=ClassificationResult, tags=["Classification"])
+def classify_complaint(request: ComplaintRequest):
+    if classifier is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Model not loaded. Run `python model/train.py` first.",
+        )
+
     start = time.time()
-    result = predict(request.text)
-    elapsed = round((time.time() - start) * 1000, 2)
-    routing = DEPARTMENT_MAP.get(result["category"], DEPARTMENT_MAP["General"])
+    result = classifier.predict(request.text)
+    elapsed_ms = round((time.time() - start) * 1000, 2)
+
+    category = result["category"]
+    routing = DEPARTMENT_MAP.get(category, DEPARTMENT_MAP["General"])
+
     return ClassificationResult(
-        category=result["category"],
+        category=category,
         confidence=result["confidence"],
         department=routing["department"],
         priority=routing["priority"],
         all_scores=result["all_scores"] if request.include_all_scores else None,
-        processing_time_ms=elapsed,
+        processing_time_ms=elapsed_ms,
     )
 
-@app.post("/classify/batch")
+
+@app.post("/classify/batch", tags=["Classification"])
 def classify_batch(request: BatchRequest):
+    if classifier is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Model not loaded. Run `python model/train.py` first.",
+        )
+
     start = time.time()
     results = []
     for text in request.complaints:
-        r = predict(text)
-        routing = DEPARTMENT_MAP.get(r["category"], DEPARTMENT_MAP["General"])
-        results.append({"text": text[:100], "category": r["category"], "confidence": r["confidence"], "department": routing["department"], "priority": routing["priority"]})
-    return {"total": len(results), "processing_time_ms": round((time.time() - start) * 1000, 2), "results": results}
+        result = classifier.predict(text)
+        category = result["category"]
+        routing = DEPARTMENT_MAP.get(category, DEPARTMENT_MAP["General"])
+        results.append({
+            "text": text[:100] + ("..." if len(text) > 100 else ""),
+            "category": category,
+            "confidence": result["confidence"],
+            "department": routing["department"],
+            "priority": routing["priority"],
+        })
+
+    elapsed_ms = round((time.time() - start) * 1000, 2)
+
+    return {
+        "total": len(results),
+        "processing_time_ms": elapsed_ms,
+        "results": results,
+    }
